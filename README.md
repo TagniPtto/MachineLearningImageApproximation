@@ -103,4 +103,4 @@ The neural network in this project takes two input values (x, y coordinates, typ
 
 ### Other websites
 - https://medium.com/@senanahmedli89/building-neural-networks-manually-from-scratch-a-beginners-hello-world-efaf6acb8f76
-- https://chatgpt.com/
+
