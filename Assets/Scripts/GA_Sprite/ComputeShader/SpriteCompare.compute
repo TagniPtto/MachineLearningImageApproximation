@@ -1,0 +1,113 @@
+#pragma kernel CSMain
+
+Texture2D<float4> _TextureTarget;
+Texture2DArray<float4> _TextureGuess;
+
+RWStructuredBuffer<uint> _GroupSums; // Output fitness sums (1 per group per slice)
+
+int3 _DispatchDim; // Dispatch size (group counts)
+
+
+// === FITNESS FUNCTION ===
+int CalculateFitness(uint4 candidateColor, uint4 targetColor)
+{
+    float dist_squared = dot(candidateColor - targetColor, candidateColor - targetColor);
+    return abs(4 * 255.0f * 255.0f - dist_squared);
+}
+
+groupshared uint localSum;
+
+[numthreads(32, 32, 1)]
+void CSMain(uint3 dispatchThreadID : SV_DispatchThreadID,
+            uint3 groupThreadID : SV_GroupThreadID,
+            uint3 groupID : SV_GroupID)
+{
+    uint width, height, layers;
+    _TextureGuess.GetDimensions(width, height, layers);
+
+    bool inBounds = (dispatchThreadID.x < width && dispatchThreadID.y < height && dispatchThreadID.z < layers);
+
+    if (groupThreadID.x == 0 && groupThreadID.y == 0)
+        localSum = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (inBounds)
+    {
+        float4 colorA = _TextureTarget[dispatchThreadID.xy];
+        float4 colorB = _TextureGuess[dispatchThreadID.xyz];
+        int fitness = 0;
+        if (colorB.a > 0.0f)
+            fitness = CalculateFitness((uint4) (colorB * 255.0f), (uint4) (colorA * 255.0f));
+
+        InterlockedAdd(localSum, fitness);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (groupThreadID.x == 0 && groupThreadID.y == 0)
+    {
+        uint groupIndexInSlice = (groupID.y * _DispatchDim.x) + groupID.x;
+        uint groupsPerSlice = _DispatchDim.x * _DispatchDim.y;
+        uint sliceOffset = dispatchThreadID.z * groupsPerSlice;
+        uint finalIndex = sliceOffset + groupIndexInSlice;
+
+        _GroupSums[finalIndex] = localSum;
+    }
+}
+
+
+// === AVERAGE COLOR EXTRACTION ===
+#pragma kernel CSGetAverageColor
+RWStructuredBuffer<uint4> _ColorSums; // Output color sums (1 per group per slice)
+RWStructuredBuffer<uint> _ColorCounts; // Pixel count per group per slice
+groupshared uint4 sharedColorSum;
+groupshared uint sharedPixelCount;
+
+
+[numthreads(32, 32, 1)]
+void CSGetAverageColor(uint3 dispatchThreadID : SV_DispatchThreadID,
+                       uint3 groupThreadID : SV_GroupThreadID,
+                       uint3 groupID : SV_GroupID)
+{
+    uint width, height, layers;
+    _TextureGuess.GetDimensions(width, height, layers);
+
+    bool inBounds = (dispatchThreadID.x < width && dispatchThreadID.y < height && dispatchThreadID.z < layers);
+
+    if (groupThreadID.x == 0 && groupThreadID.y == 0)
+    {
+        sharedColorSum = uint4(0, 0, 0, 0);
+        sharedPixelCount = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (inBounds)
+    {
+        float4 guess = _TextureGuess[dispatchThreadID.xyz];
+
+        if (guess.a > 0.0f)
+        {
+            float4 target = _TextureTarget[dispatchThreadID.xy];
+            uint4 colorInt = (uint4) (target * 255.0f);
+
+            InterlockedAdd(sharedColorSum.x, colorInt.x);
+            InterlockedAdd(sharedColorSum.y, colorInt.y);
+            InterlockedAdd(sharedColorSum.z, colorInt.z);
+            InterlockedAdd(sharedColorSum.w, colorInt.w);
+            InterlockedAdd(sharedPixelCount, 1);
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (groupThreadID.x == 0 && groupThreadID.y == 0)
+    {
+        uint groupIndexInSlice = (groupID.y * _DispatchDim.x) + groupID.x;
+        uint groupsPerSlice = _DispatchDim.x * _DispatchDim.y;
+        uint sliceOffset = dispatchThreadID.z * groupsPerSlice;
+        uint finalIndex = sliceOffset + groupIndexInSlice;
+
+        _ColorSums[finalIndex] = sharedColorSum;
+        _ColorCounts[finalIndex] = sharedPixelCount;
+    }
+}

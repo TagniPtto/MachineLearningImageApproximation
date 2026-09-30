@@ -1,0 +1,13 @@
+fileFormatVersion: 2
+guid: e43aeb7e3a6fa5f408971364786a4803
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - paperTexture: {fileID: 8400000, guid: e4f0ed10d5eb5714b9133b7ec9fa7c59, type: 2}
+  - blitMaterial: {fileID: 2100000, guid: f189ae6ed02e1c44db945f70e63eafca, type: 2}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 

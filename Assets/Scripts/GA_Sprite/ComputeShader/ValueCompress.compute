@@ -1,0 +1,42 @@
+#pragma kernel CSMain
+
+StructuredBuffer<uint> _GroupSums; // Input
+RWStructuredBuffer<uint> _CompressedSums; // Output (1 per slice)
+int3 _DispatchDim; // _DispatchDim.x * _DispatchDim.y = groupsPerSlice
+
+#define THREADS 1024
+groupshared uint sharedSums[THREADS];
+
+[numthreads(THREADS, 1, 1)]
+void CSMain(uint3 groupID : SV_GroupID, uint groupThreadID : SV_GroupThreadID)
+{
+    uint sliceIndex = groupID.x; // One group per slice
+
+    uint groupsPerSlice = _DispatchDim.x * _DispatchDim.y;
+    uint sliceOffset = sliceIndex * groupsPerSlice;
+
+    uint localSum = 0;
+    for (uint i = groupThreadID; i < groupsPerSlice; i += THREADS)
+    {
+        localSum += _GroupSums[sliceOffset + i];
+    }
+
+    sharedSums[groupThreadID] = localSum;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction within thread group
+    for (uint stride = THREADS / 2; stride > 0; stride >>= 1)
+    {
+        if (groupThreadID < stride)
+        {
+            sharedSums[groupThreadID] += sharedSums[groupThreadID + stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Write result per slice
+    if (groupThreadID == 0)
+    {
+        _CompressedSums[sliceIndex] = sharedSums[0];
+    }
+}

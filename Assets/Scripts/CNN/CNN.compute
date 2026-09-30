@@ -1,0 +1,156 @@
+#define KERNEL_WEIGHT_COUNT 9
+#define ReLU(x) max(0.0f,x)
+
+struct Kernel
+{
+    float4 weights[KERNEL_WEIGHT_COUNT];
+};
+const int2 uvOffset[9] =
+{
+    int2(-1, -1), int2(0, -1), int2(1, -1),
+            int2(-1, 0), int2(0, 0), int2(1, 0),
+            int2(-1, 1), int2(0, 1), int2(1, 1)
+};
+
+RWStructuredBuffer<Kernel> kernel_buffer;
+RWStructuredBuffer<int> layer_kernel_offset;
+RWStructuredBuffer<int> layer_kernel_count;
+RWStructuredBuffer<float4> layer_bias;
+
+
+
+#pragma kernel CSConvolutionLayer
+
+RWTexture2DArray<float4> input_feature_maps;
+RWTexture2DArray<float4> output_feature_maps;
+
+uint current_convolution_layer_index;
+
+// Dispatch with z = output feature map count
+
+
+[numthreads(32, 32, 1)]
+void CSConvoluteLayer(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint width, height, input_layers;
+    input_feature_maps.GetDimensions(width, height, input_layers);
+
+    // Dispatch.z is the output layer index
+    uint2 uv = dispatchThreadID.xy;
+    uint output_layer = dispatchThreadID.z;
+
+    int kernel_offset = layer_kernel_offset[current_convolution_layer_index];
+    int kernel_count = layer_kernel_count[current_convolution_layer_index];
+
+    if (uv.x >= width || uv.y >= height || output_layer >= kernel_count)
+        return;
+
+    // Load the kernel for this output feature map
+    int kernel_index = kernel_offset + output_layer;
+    Kernel kernel = kernel_buffer[kernel_index];
+
+    float4 sum = float4(0, 0, 0, 0);
+
+    // Loop over all input layers (depth-wise convolution)
+    for (uint input_layer = 0; input_layer < input_layers; ++input_layer)
+    {
+        for (int i = 0; i < KERNEL_WEIGHT_COUNT; ++i)
+        {
+            int2 offsetUV = uv + uvOffset[i];
+
+            if (offsetUV.x >= 0 && offsetUV.y >= 0 && offsetUV.x < width && offsetUV.y < height)
+            {
+                float4 input_sample = input_feature_maps[int3(offsetUV, input_layer)];
+                float4 weight = kernel.weights[i];
+
+                sum.r += input_sample.r * weight.r;
+                sum.g += input_sample.g * weight.g;
+                sum.b += input_sample.b * weight.b;
+                sum.a += input_sample.a * weight.a;
+            }
+        }
+    }
+
+    output_feature_maps[int3(uv, output_layer)] = ReLU(sum + layer_bias[output_layer]);
+}
+
+#pragma kernel CSInputLayer
+
+RWTexture2D<float4> texture_guess;
+RWTexture2D<float4> texture_target;
+
+[numthreads(32,32,1)]
+void CSInputLayer(uint3 dispatchThreadID : SV_DispatchThreadID,
+            uint3 groupId : SV_GroupID,
+            uint3 groupThreadId : SV_GroupThreadID)
+{
+    uint width, height;
+    texture_target.GetDimensions(width, height);
+
+    
+    if (!(dispatchThreadID.x < width && dispatchThreadID.y < height))
+        return;
+    input_feature_maps[uint3(dispatchThreadID.xy, 0)] = texture_target[dispatchThreadID.xy];
+}
+
+
+#pragma kernel CSPoolingLayer
+
+RWStructuredBuffer<int3> pixels_chosen;
+[numthreads(32,32,1)]
+void CSPoolingLayer(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint width, height, layers;
+    input_feature_maps.GetDimensions(width, height, layers);
+    
+    if (dispatchThreadID.x >= width / 2 || dispatchThreadID.y >= height / 2 || dispatchThreadID.z >= layers)
+        return;
+    
+    int2 uv_coord = dispatchThreadID.xy * 2;
+    float4 value1 = input_feature_maps[int3(uv_coord + int2(0, 0), dispatchThreadID.z)];
+    float4 value2 = input_feature_maps[int3(uv_coord + int2(1, 0), dispatchThreadID.z)];
+    float4 value3 = input_feature_maps[int3(uv_coord + int2(1, 1), dispatchThreadID.z)];
+    float4 value4 = input_feature_maps[int3(uv_coord + int2(0, 1), dispatchThreadID.z)];
+    
+    float4 max_value = max(value1, max(value2, max(value3, value4)));
+    
+    uint index_1d = dispatchThreadID.x + dispatchThreadID.y * (width / 2) + dispatchThreadID.z * (width / 2) * (height / 2);
+    switch (max_value)
+    {
+        case value1:
+            pixels_chosen[index_1d] = int3(uv_coord + int2(0, 0), dispatchThreadID.z);
+            break;
+        case value2:
+            pixels_chosen[index_1d] = int3(uv_coord + int2(1, 0), dispatchThreadID.z);
+            break;
+        case value3:
+            pixels_chosen[index_1d] = int3(uv_coord + int2(1, 1), dispatchThreadID.z);
+            break;
+        case value4:
+            pixels_chosen[index_1d] = int3(uv_coord + int2(0, 1), dispatchThreadID.z);
+            break;
+    }
+    
+    
+    output_feature_maps[int3(dispatchThreadID.xy, dispatchThreadID.z)] = max_value;
+
+}
+
+#pragma kernel CSFlattenLayer
+
+[numthreads(1,1,1)]
+
+void CSFlattenLayer(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    
+}
+
+#pragma kernel CSFullyConnectedLayer
+
+[numthreads(1,1,1)]
+void CSFullyConnectedLayer(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    
+}
+
+

@@ -1,0 +1,540 @@
+
+#pragma kernel CSFeedForward
+#pragma kernel CSFeedBackward
+#pragma kernel CSAccumulateGradients
+#pragma kernel CSApplyGradients
+#pragma kernel CSClearGradients
+
+Texture2D<float4> _InputImage;
+RWTexture2D<float4> _ResultImage;
+
+
+// Network info-----------------------------------------------------------------
+int layerCount;
+
+int networkNodeCount;
+int networkWeightCount;
+int networkBiasCount;
+float learningRate;
+float edgeLossWeight;
+
+RWStructuredBuffer<int2> randomPixelCoords;
+int batchStartingOffset;
+int batchThreadAmount;
+//-------------------------------------------------------------------------------
+
+//Network Data----------------------------------------------------------------------
+
+//shared for all groups
+RWStructuredBuffer<int3> _LayerPropertyOffsetPacked; // [layerId] = { weightOffset, biasOffset, nodeOffset }
+RWStructuredBuffer<int> _Layer_NodeCount;
+
+RWStructuredBuffer<float> _Weights;
+RWStructuredBuffer<float> _Biases;
+
+//unique for each group
+RWStructuredBuffer<float2> _NodeValuesPacked; // [index] = { activeValue, gradient }
+RWStructuredBuffer<float> _WeightGradientValues;
+RWStructuredBuffer<float> _BiasGradientValues;
+//-------------------------------------------------------------------------------
+
+
+
+#define WEIGHT(layerId, weightId)                   _Weights[GetWeightIndex(layerId, weightId)]
+
+#define BIAS(layerId, biasId)                       _Biases[GetBiasIndex(layerId, biasId)]
+
+#define WEIGHT_GRADIENT(groupId,layerId, weightId)  _WeightGradientValues[GetWeightGradientIndex(groupId,layerId, weightId)]
+
+#define BIAS_GRADIENT(groupId,layerId, biasId)      _BiasGradientValues[GetBiasGradientIndex(groupId,layerId, biasId)]
+
+#define ACTIVE_NODE(groupId,layerId,nodeId)         _NodeValuesPacked[GetNodeIndex(groupId, layerId, nodeId)].x
+
+#define NODE_GRADIENT(groupId,layerId,nodeId)       _NodeValuesPacked[GetNodeIndex(groupId, layerId, nodeId)].y
+
+
+#define EXPLOSION_CAP 10.0f
+
+int GetNodeIndex(int groupId, int layerId, int nodeId)
+{
+    return groupId * networkNodeCount + _LayerPropertyOffsetPacked[layerId].z + nodeId;
+}
+int GetWeightGradientIndex(int groupId,int layedId, int weigthId)
+{
+    return groupId * networkWeightCount + _LayerPropertyOffsetPacked[layedId].x + weigthId;
+}
+int GetBiasGradientIndex(int groupId,int layerId, int biasId)
+{
+    return groupId * networkBiasCount + _LayerPropertyOffsetPacked[layerId].y + biasId;
+}
+
+
+int GetWeightIndex(int layedId, int weigthId)
+{
+    return _LayerPropertyOffsetPacked[layedId].x + weigthId;
+}
+int GetBiasIndex(int layerId, int biasId)
+{
+    return _LayerPropertyOffsetPacked[layerId].y + biasId;
+}
+
+
+float Sigmoid(float x)
+{
+    return 1.0 / (1.0 + exp(-x));
+}
+
+#define LEAKY_RELU_HYPER_PARAMETER 0.1f
+
+float LeakyReLU(float x)
+{
+    return max(LEAKY_RELU_HYPER_PARAMETER * x, x);
+
+}
+
+float LeakyReLUDerivative(float x)
+{
+    return x >= 0 ? 1.0 : LEAKY_RELU_HYPER_PARAMETER;
+}
+
+float3 Sobel5x5X(uint2 id, Texture2D<float4> tex)
+{
+    int2 offset[25] =
+    {
+        int2(-2, -2), int2(-1, -2), int2(0, -2), int2(1, -2), int2(2, -2),
+        int2(-2, -1), int2(-1, -1), int2(0, -1), int2(1, -1), int2(2, -1),
+        int2(-2, 0), int2(-1, 0), int2(0, 0), int2(1, 0), int2(2, 0),
+        int2(-2, 1), int2(-1, 1), int2(0, 1), int2(1, 1), int2(2, 1),
+        int2(-2, 2), int2(-1, 2), int2(0, 2), int2(1, 2), int2(2, 2)
+    };
+    float kernelX[25] =
+    {
+        -2, -1, 0, 1, 2,
+        -3, -2, 0, 2, 3,
+        -4, -3, 0, 3, 4,
+        -3, -2, 0, 2, 3,
+        -2, -1, 0, 1, 2
+    };
+    float3 gx = float3(0, 0, 0);
+    for (int i = 0; i < 25; ++i)
+    {
+        float3 col = tex[id + offset[i]].rgb;
+        gx += col * kernelX[i];
+    }
+    return gx / 48.0f; // Normalization factor (sum of abs(kernelX))
+}
+
+float3 Sobel5x5Y(uint2 id, Texture2D<float4> tex)
+{
+    int2 offset[25] =
+    {
+        int2(-2, -2), int2(-1, -2), int2(0, -2), int2(1, -2), int2(2, -2),
+        int2(-2, -1), int2(-1, -1), int2(0, -1), int2(1, -1), int2(2, -1),
+        int2(-2, 0), int2(-1, 0), int2(0, 0), int2(1, 0), int2(2, 0),
+        int2(-2, 1), int2(-1, 1), int2(0, 1), int2(1, 1), int2(2, 1),
+        int2(-2, 2), int2(-1, 2), int2(0, 2), int2(1, 2), int2(2, 2)
+    };
+    float kernelY[25] =
+    {
+        -2, -3, -4, -3, -2,
+        -1, -2, -3, -2, -1,
+         0, 0, 0, 0, 0,
+         1, 2, 3, 2, 1,
+         2, 3, 4, 3, 2
+    };
+    float3 gy = float3(0, 0, 0);
+    for (int i = 0; i < 25; ++i)
+    {
+        float3 col = tex[id + offset[i]].rgb;
+        gy += col * kernelY[i];
+    }
+    return gy / 48.0f; // Normalization factor (sum of abs(kernelY))
+}
+
+float3 Sobel5x5X(uint2 id, RWTexture2D<float4> tex)
+{
+    int2 offset[25] =
+    {
+        int2(-2, -2), int2(-1, -2), int2(0, -2), int2(1, -2), int2(2, -2),
+        int2(-2, -1), int2(-1, -1), int2(0, -1), int2(1, -1), int2(2, -1),
+        int2(-2, 0), int2(-1, 0), int2(0, 0), int2(1, 0), int2(2, 0),
+        int2(-2, 1), int2(-1, 1), int2(0, 1), int2(1, 1), int2(2, 1),
+        int2(-2, 2), int2(-1, 2), int2(0, 2), int2(1, 2), int2(2, 2)
+    };
+    float kernelX[25] =
+    {
+        -2, -1, 0, 1, 2,
+        -3, -2, 0, 2, 3,
+        -4, -3, 0, 3, 4,
+        -3, -2, 0, 2, 3,
+        -2, -1, 0, 1, 2
+    };
+    float3 gx = float3(0, 0, 0);
+    for (int i = 0; i < 25; ++i)
+    {
+        float3 col = tex[id + offset[i]].rgb;
+        gx += col * kernelX[i];
+    }
+    return gx / 48.0f; // Normalization factor (sum of abs(kernelX))
+}
+
+float3 Sobel5x5Y(uint2 id, RWTexture2D<float4> tex)
+{
+    int2 offset[25] =
+    {
+        int2(-2, -2), int2(-1, -2), int2(0, -2), int2(1, -2), int2(2, -2),
+        int2(-2, -1), int2(-1, -1), int2(0, -1), int2(1, -1), int2(2, -1),
+        int2(-2, 0), int2(-1, 0), int2(0, 0), int2(1, 0), int2(2, 0),
+        int2(-2, 1), int2(-1, 1), int2(0, 1), int2(1, 1), int2(2, 1),
+        int2(-2, 2), int2(-1, 2), int2(0, 2), int2(1, 2), int2(2, 2)
+    };
+    float kernelY[25] =
+    {
+        -2, -3, -4, -3, -2,
+        -1, -2, -3, -2, -1,
+         0, 0, 0, 0, 0,
+         1, 2, 3, 2, 1,
+         2, 3, 4, 3, 2
+    };
+    float3 gy = float3(0, 0, 0);
+    for (int i = 0; i < 25; ++i)
+    {
+        float3 col = tex[id + offset[i]].rgb;
+        gy += col * kernelY[i];
+    }
+    return gy / 48.0f; // Normalization factor (sum of abs(kernelY))
+}
+
+
+float SigmoidDerivative(float activationValue)
+{
+    return activationValue * (1.0 - activationValue);
+}
+
+void ProccessConnectedLayers( int groupId, int layerIndex)
+{
+    int currentLayerNodeCount = _Layer_NodeCount[layerIndex];
+    int previousLayerNodeCount = _Layer_NodeCount[layerIndex - 1];
+
+    for (int i = 0; i < currentLayerNodeCount; ++i)
+    {
+        float sum = 0;
+        for (int j = 0; j < previousLayerNodeCount; ++j)
+        {
+            sum += WEIGHT(layerIndex, previousLayerNodeCount * i + j) * ACTIVE_NODE(groupId, layerIndex - 1, j);
+        }
+        sum += BIAS(layerIndex, i);
+        sum = max(min(LeakyReLU(sum), EXPLOSION_CAP), -EXPLOSION_CAP);
+        ACTIVE_NODE(groupId, layerIndex, i) = sum;
+    }
+}
+
+
+[numthreads(16, 1, 1)]
+void CSFeedForward(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    int width, height;
+    _InputImage.GetDimensions(width, height);
+
+    int groupIndex = dispatchThreadID.x;
+
+    
+    if (int(batchStartingOffset + dispatchThreadID.x) >= width * height)
+        return;
+    
+    int2 inputCoord = randomPixelCoords[batchStartingOffset + dispatchThreadID.x];
+    float xNorm = (inputCoord.x / (float) (width - 1));
+    float yNorm = (inputCoord.y / (float) (height - 1));
+    {
+        int currentLayerNodeCount = _Layer_NodeCount[0];
+        int previousLayerNodeCount = 2;
+
+        for (int i = 0; i < currentLayerNodeCount; ++i)
+        {
+            float sum = 0;
+            sum += WEIGHT(0, previousLayerNodeCount * i + 0) * xNorm;
+            sum += WEIGHT(0, previousLayerNodeCount * i + 1) * yNorm;
+            sum += BIAS(0, i);
+            sum = max(min(LeakyReLU(sum), EXPLOSION_CAP), -EXPLOSION_CAP);
+            ACTIVE_NODE(groupIndex, 0, i) = sum;
+        }
+    }
+    
+
+    for (int l = 1; l < layerCount - 1; ++l)
+    {
+        ProccessConnectedLayers(groupIndex, l);
+    }
+    {
+        
+        int currentLayerIndex = layerCount - 1;
+        int previousLayerIndex = layerCount - 2;
+        
+        int currentLayerNodeCount = _Layer_NodeCount[currentLayerIndex];
+        int previousLayerNodeCount = _Layer_NodeCount[previousLayerIndex];
+
+        for (int i = 0; i < currentLayerNodeCount; ++i)
+        {
+            float sum = 0;
+            for (int j = 0; j < previousLayerNodeCount; ++j)
+            {
+                sum += WEIGHT(currentLayerIndex, previousLayerNodeCount * i + j) * ACTIVE_NODE(groupIndex, previousLayerIndex, j);
+            }
+            sum += BIAS(currentLayerIndex, i);
+            sum = max(min(Sigmoid(sum), EXPLOSION_CAP), -EXPLOSION_CAP);
+        ACTIVE_NODE(groupIndex, currentLayerIndex, i) = sum;
+        }
+    }
+
+    float r = ACTIVE_NODE(groupIndex, layerCount - 1, 0);
+    float g = ACTIVE_NODE(groupIndex, layerCount - 1, 1);
+    float b = ACTIVE_NODE(groupIndex, layerCount - 1, 2);
+    float a = ACTIVE_NODE(groupIndex, layerCount - 1, 3);
+
+    _ResultImage[inputCoord] = float4(r, g, b, a);
+
+}
+
+
+
+
+void CalculateGradientLayer(int groupId, int layerIndex ,inout float norm)
+{
+    int currentLayerNodeCount = _Layer_NodeCount[layerIndex];
+    int previousLayerNodeCount = _Layer_NodeCount[layerIndex - 1];
+
+    for (int i = 0; i < currentLayerNodeCount; ++i)
+    {
+        float incompleteGradient = LeakyReLUDerivative(ACTIVE_NODE(groupId, layerIndex, i)) * NODE_GRADIENT(groupId, layerIndex, i);
+        for (int j = 0; j < previousLayerNodeCount; ++j)
+        {
+            NODE_GRADIENT(groupId, layerIndex - 1, j) += WEIGHT(layerIndex, previousLayerNodeCount * i + j) * incompleteGradient;
+
+            WEIGHT_GRADIENT(groupId, layerIndex, previousLayerNodeCount * i + j) = ACTIVE_NODE(groupId, layerIndex - 1, j) * incompleteGradient;
+            
+            norm += WEIGHT_GRADIENT(groupId, layerIndex, previousLayerNodeCount * i + j) * WEIGHT_GRADIENT(groupId, layerIndex, previousLayerNodeCount * i + j);
+        }
+        BIAS_GRADIENT(groupId, layerIndex, i) = incompleteGradient;
+        
+        
+        //Needed for clipping
+        norm += BIAS_GRADIENT(groupId, layerIndex, i) * BIAS_GRADIENT(groupId, layerIndex, i);
+
+    }
+}
+
+
+#define GRADIENT_CLIP_NORM 20.f
+[numthreads(16, 1, 1)]
+void CSFeedBackward(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    int width, height;
+    _InputImage.GetDimensions(width, height);
+
+    int groupIndex = dispatchThreadID.x;
+    if (int(batchStartingOffset + dispatchThreadID.x) >= width * height)
+        return;
+    int2 inputCoord = randomPixelCoords[batchStartingOffset + dispatchThreadID.x];
+    float xNorm =(inputCoord.x / (float) (width - 1)) ;
+    float yNorm =(inputCoord.y / (float) (height - 1)) ;
+
+
+    {
+        for (int g = 0; g < layerCount; ++g)
+        {
+            int nodeCount = _Layer_NodeCount[g];
+            for (int n = 0; n < nodeCount; ++n)
+            {
+            NODE_GRADIENT(groupIndex, g, n) = 0.0f;
+            }
+        }
+    }
+    
+    float4 targetColor = _InputImage[inputCoord];
+    float4 outputColor = _ResultImage[inputCoord];
+
+
+    float4 error = outputColor - targetColor;
+    float4 pixel_grad = 2* error ;
+    
+    
+    float3 SobelYDiff = (Sobel5x5Y(inputCoord, _InputImage) - Sobel5x5Y(inputCoord, _ResultImage));
+    float3 SobelXDiff = (Sobel5x5X(inputCoord, _InputImage) - Sobel5x5X(inputCoord, _ResultImage));
+    float3 sobel_diff = abs(SobelYDiff) + abs(SobelXDiff);
+    sobel_diff = sobel_diff * sobel_diff;
+
+   
+    //_ResultImage[inputCoord] = float4(sobel_diff.r, sobel_diff.g, sobel_diff.b, 1.0f);
+
+        
+
+    pixel_grad  +=  edgeLossWeight * float4(sobel_diff,0.0f);
+    
+    NODE_GRADIENT(groupIndex, layerCount - 1, 0) = pixel_grad.r;
+    NODE_GRADIENT(groupIndex, layerCount - 1, 1) = pixel_grad.g;
+    NODE_GRADIENT(groupIndex, layerCount - 1, 2) = pixel_grad.b;
+    NODE_GRADIENT(groupIndex, layerCount - 1, 3) = pixel_grad.a;
+    
+    
+    float gradientNorm = 0.0f;
+    {
+                
+        int currentLayerIndex = layerCount - 1;
+        int previousLayerIndex = layerCount - 2;
+        int currentLayerNodeCount = _Layer_NodeCount[currentLayerIndex];
+        int previousLayerNodeCount = _Layer_NodeCount[previousLayerIndex];
+
+        for (int i = 0; i < currentLayerNodeCount; ++i)
+        {
+            float incompleteGradient = SigmoidDerivative(ACTIVE_NODE(groupIndex, currentLayerIndex, i)) * NODE_GRADIENT(groupIndex, currentLayerIndex, i);
+            for (int j = 0; j < previousLayerNodeCount; ++j)
+            {
+                NODE_GRADIENT(groupIndex, previousLayerIndex, j) += WEIGHT(currentLayerIndex, previousLayerNodeCount * i + j) * incompleteGradient;
+
+                WEIGHT_GRADIENT(groupIndex, currentLayerIndex, previousLayerNodeCount * i + j) += ACTIVE_NODE(groupIndex, previousLayerIndex, j) * incompleteGradient;
+            
+                gradientNorm += WEIGHT_GRADIENT(groupIndex, currentLayerIndex, previousLayerNodeCount * i + j) * WEIGHT_GRADIENT(groupIndex, currentLayerIndex, previousLayerNodeCount * i + j);
+       
+            }
+            BIAS_GRADIENT(groupIndex, currentLayerIndex, i) = incompleteGradient;
+
+            gradientNorm += BIAS_GRADIENT(groupIndex, currentLayerIndex, i) * BIAS_GRADIENT(groupIndex, currentLayerIndex, i);
+        }
+    }
+    
+    for (int l = layerCount - 2 ; l > 0; --l) 
+    {
+        CalculateGradientLayer(groupIndex, l, gradientNorm);
+    }
+    {
+        int currentLayerNodeCount = _Layer_NodeCount[0];
+        int previousLayerNodeCount = 2;
+
+        for (int i = 0; i < currentLayerNodeCount; ++i)
+        {
+            float incompleteGradient = LeakyReLUDerivative(ACTIVE_NODE(groupIndex, 0, i)) * NODE_GRADIENT(groupIndex, 0, i);
+            
+        WEIGHT_GRADIENT(groupIndex, 0, previousLayerNodeCount * i + 0) = xNorm * incompleteGradient;
+        WEIGHT_GRADIENT(groupIndex, 0, previousLayerNodeCount * i + 1) = yNorm * incompleteGradient;
+        gradientNorm += WEIGHT_GRADIENT(groupIndex, 0, previousLayerNodeCount * i + 0) * WEIGHT_GRADIENT(groupIndex, 0, previousLayerNodeCount * i + 0);
+        gradientNorm += WEIGHT_GRADIENT(groupIndex, 0, previousLayerNodeCount * i + 1) * WEIGHT_GRADIENT(groupIndex, 0, previousLayerNodeCount * i + 1);
+       
+        BIAS_GRADIENT(groupIndex, 0, i) = incompleteGradient;
+            gradientNorm += BIAS_GRADIENT(groupIndex, 0, i) * BIAS_GRADIENT(groupIndex, 0, i);
+       
+        }
+    }
+    
+    //ReUsing nodeBuffer for gradientNorm
+    float norm = sqrt(gradientNorm);
+    ACTIVE_NODE(groupIndex, 0, 0) = (norm > GRADIENT_CLIP_NORM) ? (GRADIENT_CLIP_NORM / norm) : 1.0f;
+
+}
+
+
+[numthreads(1024, 1, 1)]
+void CSAccumulateGradients(uint3 dispatchThreadID : SV_DispatchThreadID, uint3 groupID : SV_GroupID, uint3 groupThreadID : SV_GroupThreadID)
+{
+    uint index = dispatchThreadID.x;
+    //// Only thread 0 computes scales
+
+
+    // Now all threads can safely use scales[]
+    if (index < (uint) networkWeightCount)
+    {
+        float sum = 0;
+        for (uint g = 0; g < (uint) batchThreadAmount; ++g)
+        {
+            float sampleGradient = _WeightGradientValues[g * networkWeightCount + index];
+            sampleGradient *= ACTIVE_NODE(g, 0, 0); // Apply global norm clipping scale
+            sum += sampleGradient;
+        }
+        _WeightGradientValues[index] = sum / batchThreadAmount;
+    }
+
+    if (index < (uint) networkBiasCount)
+    {
+        float sum = 0;
+        for (uint g = 0; g < (uint) batchThreadAmount; ++g)
+        {
+            float sampleGradient = _BiasGradientValues[g * networkBiasCount + index];
+            sampleGradient *= ACTIVE_NODE(g, 0, 0); // Apply global norm clipping scale
+            sum += sampleGradient;
+        }
+        _BiasGradientValues[index] = sum / batchThreadAmount;
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void CSApplyGradients(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    
+    int index = dispatchThreadID.x;
+    // Apply gradient to weights
+    if (index < networkWeightCount)
+    {
+        float currentWeight = _Weights[index];
+        float gradient = _WeightGradientValues[index];
+        currentWeight -= learningRate * gradient;
+        _Weights[index] = currentWeight;
+    }
+
+    // Apply gradient to biases
+    if (index < networkBiasCount)
+    {
+        float currentBias = _Biases[index];
+        float biasGradient = _BiasGradientValues[index];
+        currentBias -= learningRate * biasGradient;
+        _Biases[index] = currentBias;
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void CSClearGradients(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    uint index = dispatchThreadID.x;
+    
+    if (index < (uint) networkWeightCount)
+    {
+        for (uint g = 0; g < (uint) batchThreadAmount; ++g)
+        {
+            _WeightGradientValues[g * networkWeightCount + index] = 0;
+        }
+    }
+
+    if (index < (uint) networkBiasCount)
+    {
+        for (uint g = 0; g < (uint) batchThreadAmount; ++g)
+        {
+            _BiasGradientValues[g * networkBiasCount + index] = 0;
+        }
+    }
+}
+
+
+
+#pragma kernel CSBlitFourierFeatures
+RWStructuredBuffer<float> _FourierFeatures;
+
+int fourierFeatureCount;
+
+#define GET_FOURIER_COEFFICIENT_R(row , column) _FourierFeatures[index * 4])
+#define GET_FOURIER_COEFFICIENT_G(row , column) _FourierFeatures[index * 4])
+#define GET_FOURIER_COEFFICIENT_B(row , column) _FourierFeatures[index * 4])
+#define GET_FOURIER_COEFFICIENT_A(row , column) _FourierFeatures[index * 4])
+[numthreads(16, 16, 1)]
+void CSBlitFourierFeatures(uint3 dispatchThreadID : SV_DispatchThreadID)
+{
+    int width, height;
+    _InputImage.GetDimensions(width, height);
+    int2 pixelCoord = int2(dispatchThreadID.xy);
+    if (pixelCoord.x >= width || pixelCoord.y >= height)
+        return;
+    float4 color = _InputImage[pixelCoord];
+    
+    // Normalize the pixel coordinates
+    float xNorm = (pixelCoord.x / (float) (width - 1));
+    float yNorm = (pixelCoord.y / (float) (height - 1));
+    // Store the normalized coordinates in the result texture
+    _ResultImage[pixelCoord] = float4(xNorm, yNorm, color.r, color.g);
+}
